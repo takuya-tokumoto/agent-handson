@@ -1,0 +1,5 @@
+claude-agent-sdk
+a2a-sdk[http-server]
+httpx
+python-dotenv
+uvicorn

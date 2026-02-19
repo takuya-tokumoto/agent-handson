@@ -1,14 +1,21 @@
-FROM mcr.microsoft.com/playwright:v1.51.0-noble
+# Playwright公式イメージ（ブラウザ実行に必要な依存が揃っている）
+FROM mcr.microsoft.com/playwright:v1.58.2-jammy
 
-# Python 3.12 + uv
-RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv && \
-    rm -rf /var/lib/apt/lists/*
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-
+ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
-COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-install-project
-COPY . .
-RUN uv sync --frozen
 
-EXPOSE 9999
+# Python環境（Ubuntu 22.04ベースなのでpython3はあるが、pip等を確実にする）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# 依存関係
+COPY requirements.txt /app/requirements.txt
+RUN python3 -m pip install --upgrade pip && \
+    python3 -m pip install -r /app/requirements.txt
+
+# アプリ本体はマウント運用でも良いが、ここでは一応COPYも可能にしておく
+COPY . /app
+
+# デフォルトはシェル（必要なら main.py にしてもOK）
+CMD ["bash"]
