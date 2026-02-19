@@ -512,4 +512,285 @@ async def main():
         save_markdown(draft_path, draft_text)
 
         print("\n--- A2Aレビュー ---\n")
-        
+
+### **2.5 Dockerイメージのビルド（WSLターミナル）**
+
+`agent-handson` ディレクトリで：
+
+```markdown
+docker build -t agent-handson:latest .
+```
+
+### **2.6 実⾏（コンテナで2プロセス動かす）**
+
+#### 2.6.1 ターミナル1：レビューエージェント起動（コンテナ）
+
+```markdown
+docker run --rm -it \
+  --env-file ./.env \
+  -p 9999:9999 \
+  -v "$PWD:/app" \
+  -w /app \
+  agent-handson:latest \
+  python3 review_agent.py
+```
+
+確認（任意、別ターミナルで）：
+
+```markdown
+curl http://localhost:9999/.well-known/agent-card.json
+```
+
+#### 2.6.2 ターミナル2：記事作成エージェント起動（コンテナ）
+
+```markdown
+docker run --rm -it \
+  --env-file ./.env \
+  -v "$PWD:/app" \
+  -w /app \
+  agent-handson:latest \
+  python3 main.py
+```
+
+⽣成物：
+`output/draft_YYYYMMDD_HHMMSS.md`
+`output/final_YYYYMMDD_HHMMSS.md`
+※ `-v "$PWD:/app"` でホストのフォルダをマウントしているため、⽣成物はホスト側 `agent-handson/output/` に残ります。
+
+### **3. 解説**
+
+#### **3.1 全体アーキテクチャ**
+
+このシステムは⼤きく5つの要素で構成
+
+1.  **記事作成エージェント `main.py`**
+    ユーザー⼊⼒を受け取り、LLMと対話してドラフト→最終版を⽣成
+2.  **レビューエージェント `review_agent.py`**
+    A2Aサーバとして動作し、ドラmain.py`**
+    ユーザー⼊⼒を受け取り、LLMと対話してドラフト→最終版を⽣成
+2.  **レビューエージェント `review_agent.py`**
+    A2Aサーバとして動作し、ドラフトをチェックして改善点を返す
+3.  **Claude Agent SDK** (`claude-agent-sdk`) (ライブラリ)
+    LLMとの対話・ツール呼び出し・MCPサーバ管理を担う中核
+    *要素* / *対応ファイル* / *役割*
+4.  **Playwright MCP** (`@playwright/mcp`) (npmパッケージ)
+    ヘッドレスブラウザでWebページを閲覧する
+5.  **A2Aクライアント** (`tools_action_manager.py`)
+    レビューエージェントにHTTPでドラフトを送信
+
+#### **3.2 処理フロー（シーケンス図）**
+
+##### Phase 1：ドラフト⽣成
+
+1.  ユーザーがCLIからプロンプトを⼊⼒（URLを含めてもOK）
+2.  `main.py` が Claude Agent SDK の `query` 関数を呼び出し、LLMと対話を開始
+3.  LLMが必要と判断した場合、Playwright MCP 経由でWebページにアクセスし、記事の内容を取得
+4.  取得した情報をもとに、Markdown形式のドラフトを⽣成し、 `output/draft_*.md` として保存
+
+##### Phase 2：A2Aレビュー
+
+5.  ⽣成されたドラフトを A2Aクライアント が HTTP POST で レビューエージェント（Port 9999）に送信
+6.  レビューエージェントは必須セクションの有無・⽂字数・参考リンクの有無をチェックし、改善点をテキストで返す
+
+##### Phase 3：最終版⽣成
+
+7.  ドラフトとレビュー結果を合わせて再度 Claude Agent SDK 経由でLLMに投げ、改善版を⽣成
+8.  最終版を `output/final_*.md` として保存
+
+#### **3.3 各技術の役割と該当コード**
+
+##### **3.3.1 Claude Agent SDK ̶ エージェントの「頭脳」**
+
+Claude Agent SDK は、このシステム全体の中核
+LLM（Claude）との対話、ツールの管理、MCPサーバの起動をすべてこのSDKが担う
+
+##### ① LLMとの対話（query関数）
+
+`main.py` の以下の部分で、Claude Agent SDK の `query` 関数を使ってLLMとやり取り
+
+```python
+# main.py（12⾏⽬）
+from claude_agent_sdk import query, ClaudeAgentOptions
+
+# main.py（114-121⾏⽬）
+async def run_agent_stream_text(prompt: str, options: ClaudeAgentOptions) -> str:
+    out = []
+    async for msg in query(prompt=prompt, options=options):
+        text = _text_from_msg(msg)
+        if text:
+            print(text, flush=True)  # ストリーミング表⽰
+            out.append(text)
+    return "\n".join(out).strip()
+```
+
+ポイントは `async for msg in query(...)` の部分。 `query` はジェネレータとして動作し、LLMからの応答をストリーミングで1メッセージずつ受け取る。これにより、⽣成途中の⽂章がリアルタイムに画⾯に表⽰される。
+
+##### ② MCPサーバの管理
+
+`ClaudeAgentOptions` の `mcp_servers` パラメータで、どのMCPサーバを使うかを宣⾔的に指定。
+
+```python
+# main.py（127-143⾏⽬）
+options = ClaudeAgentOptions(
+    mcp_servers={
+        "playwright": {                              # ← MCPサーバ名
+            "type": "stdio",                          # ← 通信⽅式（標準⼊出⼒）
+```
+
+`mcp_servers` に設定を書くだけで、SDK が⾃動的に Playwright MCP サーバをサブプロセスとして起動し、stdio （標準⼊出⼒）経由で通信可能に。開発者はブラウザの起動・管理を⼀切意識する必要なし。
+
+##### ③ ツール権限制御（allowed_tools）
+
+`allowed_tools` でLLMが使えるツールを明⽰的に制限。 `"mcp__playwright__*"` のようにワイルドカード指定することで、Playwright MCPが提供するすべてのツール（ページ遷移、テキスト取得、スクリーンショットなど）をまとめて許可。
+
+##### **3.3.2 MCP（Model Context Protocol） ̶ ツール連携の「標準規格」**
+
+MCP は、LLMが外部ツール（ブラウザ、ファイルシステム、データベースなど）と連携するための標準プロトコル。このハンズオンでは Playwright MCP を使って、LLMにWebブラウザ操作の能⼒を与えている。
+
+##### MCPの動作の仕組み
+
+MCPの通信は以下のように動作。
+具体的には、SDK の `mcp_servers` 設定に基づいて以下が⾃動で実⾏。
+
+1.  **サーバ起動**: `npx @playwright/mcp@latest --headless` が⼦プロセスとして起動される
+2.  **ツール発⾒**: MCP の `tools/list` メッセージにより、利⽤可能なツール⼀覧が⾃動取得される (`mcp__playwright__navigate`, `mcp__playwright__snapshot` など)
+3.  **ツール呼び出し**: LLMが「このURLを読みたい」と判断すると、SDK が MCP の `tools/call` メッセージを送り、Playwright がブラウザを操作してページ内容を返す
+
+```python
+6             "command": "npx",                         # ← 起動コマンド
+7             "args": ["-y", "@playwright/mcp@latest", "--headless"],
+8         }
+9     },
+10    allowed_tools=[
+11        "mcp__playwright__*",  # ← Playwright MCPの全ツールを許可
+12        "WebFetch",            # ← Web取得（組み込みツール）
+13        "Read",                # ← ファイル読み込み
+14        "Write",               # ← ファイル書き込み
+15        "Edit",                # ← ファイル編集
+16        "Bash",                # ← シェルコマンド実⾏
+17    ],
+18)
+```
+
+```mermaid
+graph TD
+    A[Claude Agent SDK（親プロセス）] -- stdio（標準⼊出⼒）で通信 --> B[Playwright MCP Server（⼦プロセス）]
+    B -- Playwrightライブラリ --> C[ヘッドレスChromiumブラウザ]
+    C -- HTTP --> D[Webサイト]
+```
+
+##### **3.3.3 A2A（Agent-to-Agent Protocol） ̶ エージェント間の「共通⾔語」**
+
+A2A は、Google が提唱するエージェント間通信のオープンプロトコル。異なるフレームワークで作られたエージェント同⼠が、HTTP経由で協調作業できるようになる。
+
+このハンズオンでは「レビューエージェント」を A2A サーバとして独⽴プロセスで動かし、記事作成エージェントから呼び出している。
+
+##### ① A2Aサーバ側（review_agent.py）
+
+A2Aサーバは3つの要素で構成されます。
+
+**(a) エージェントカード ̶ ⾃分の能⼒を宣⾔するメタデータ**
+
+エージェントカードは `http://localhost:9999/.well-known/agent-card.json` で公開され、クライアントはこれを読んで「このエージェントが何をできるか」を事前に知ることができる。
+
+```python
+# review_agent.py（48-65⾏⽬）
+def build_agent_card(base_url: str) -> AgentCard:
+    skill = AgentSkill(
+        id="review_draft",
+        name="レビュー（Confluenceドラフト）",
+        description="Confluence向けドラフトの不⾜セクションと改善点をチェックします。",
+        tags=["review", "checklist", "confluence"],
+        examples=["このドラフトをレビューして", "不⾜セクションを指摘して"],
+    )
+    return AgentCard(
+        name="レビューエージェント",
+        description="ドラフトをレビューしてチェックリストを返すA2Aエージェント。",
+        url=base_url,
+        version="1.0.0",
+        default_input_modes=["text"],
+        default_output_modes=["text"],
+        capabilities=AgentCapabilities(streaming=False),
+        skills=[skill],
+    )
+```
+
+**(b) タスク実⾏ロジック ̶ 実際のレビュー処理**
+
+今回はシンプルなルールベースのレビューだが、ここを別のLLMベースのエージェントに置き換えることも可能。ぜひ記事作成エージェントを参考にやってみてください。
+
+```python
+# review_agent.py（14-25⾏⽬）
+REQUIRED_SECTIONS = ["要約", "重要ポイント", "参考リンク", "次アクション"]
+
+def simple_review(text: str) -> str:
+    findings = []
+    for sec in REQUIRED_SECTIONS:
+        if sec not in text:
+            findings.append(f"- セクション不⾜: 「{sec}」を追加すると読みやすい")
+    if len(text) < 600:
+        findings.append("- ⽂字数が短め：背景/結論/根拠をもう少し⾜すと社内共有に強い")
+    if not re.search(r"https?://", text):
+        findings.append("- 参考リンクが⾒当たりません：⼀次ソースURLを最低1つ⼊れるのがお")
+    if not findings:
+        findings.append("- ⼤きな不⾜は⾒当たりません。タイトルと結論が明確で良いです。")
+    return "A2Aレビュー結果（⾃動）:\n" + "\n".join(findings)
+```
+
+**(c) サーバ起動 ̶ UvicornでHTTPサーバとして起動**
+
+```python
+# review_agent.py（68-76⾏⽬）
+if __name__ == "__main__":
+    host = "0.0.0.0"
+    port = 9999
+    base_url = f"http://localhost:{port}/"
+    agent_card = build_agent_card(base_url)
+    request_handler = DefaultRequestHandler(
+        agent_executor=ReviewExecutor(),
+        task_store=InMemoryTaskStore()
+    )
+    server = A2AStarletteApplication(
+        agent_card=agent_card, http_handler=request_handler
+    )
+    uvicorn.run(server.build(), host=host, port=port)
+```
+
+##### ② A2Aクライアント側（tools_action_manager.py）
+
+クライアント側は以下の⼿順でレビューを依頼
+
+A2A通信のポイントは以下の3ステップです。
+
+1.  **カード取得**： `/.well-known/agent-card.json` からエージェントの能⼒を確認
+2.  **メッセージ送信**： `SendMessageRequest` でドラフトテキストを送る
+3.  **結果受信**：レスポンスの `parts` からテキストを抽出
+
+```python
+# tools_action_manager.py（20-48⾏⽬）
+async def a2a_review(draft_text: str, a2a_base_url: str | None = None) -> str:
+    base = a2a_base_url or os.getenv("REVIEW_AGENT_URL", "http://localhost:9999")
+
+    async with httpx.AsyncClient() as httpx_client:
+        # 1. エージェントカードを取得（能⼒確認）
+        resolver = A2ACardResolver(httpx_client=httpx_client, base_url=base)
+        agent_card = await resolver.get_agent_card()
+
+        # 2. A2Aクライアントを初期化
+        client = A2AClient(httpx_client=httpx_client, agent_card=agent_card)
+
+        # 3. メッセージを組み⽴てて送信
+        payload = {
+            "message": {
+                "role": "user",
+                "parts": [{"kind": "text", "text": draft_text}],
+                "messageId": uuid4().hex,
+            }
+        }
+        req = SendMessageRequest(id=str(uuid4()), params=MessageSendParams(**payload))
+        resp = await client.send_message(req)
+
+        # 4. レスポンスからテキストを抽出
+        dumped = resp.model_dump(mode="json", exclude_none=True)
+        # ... テキスト抽出処理 ...
+```
