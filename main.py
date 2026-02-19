@@ -65,7 +65,7 @@ async def main():
             "playwright": {
                 "type": "stdio",
                 "command": "npx",
-                "args": ["-y", "@playwright/mcp@latest", "--headless"],
+                "args": ["-y", "@playwright/mcp@latest", "--headless", "--no-sandbox"],
             }
         },
         allowed_tools=[
