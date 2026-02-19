@@ -26,4 +26,5 @@ __pycache__/
 .env
 
 # 出力結果
+.playwright-mcp
 output/
