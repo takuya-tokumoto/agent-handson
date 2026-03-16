@@ -1,0 +1,19 @@
+sequenceDiagram
+    participant User as ユーザー
+    participant Main as main.py
+    participant SDK as Claude Agent SDK / MCP
+    participant A2A as review_agent (A2A)
+
+    User->>Main: URL + 自由プロンプト入力
+    Main->>SDK: query（1回・中でツールを任意回呼ぶ）
+    SDK->>SDK: Playwright MCP で Web 取得
+    SDK->>SDK: ドラフト作成
+    SDK->>Main: request_review ツール呼び出し
+    Main->>A2A: ドラフトを送信（A2A）
+    A2A->>Main: レビュー結果
+    Main->>SDK: ツール結果を返す
+    Note over SDK: 必要に応じて再度 request_review
+    SDK->>SDK: 修正して最終版を出力
+    SDK->>Main: 最終版本文（ResultMessage）
+    Main->>Main: output/final_*.md に保存
+    Main->>User: 完了

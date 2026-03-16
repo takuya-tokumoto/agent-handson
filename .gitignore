@@ -9,11 +9,12 @@ jupyter.log
 *.jpg
 *.csv
 *.png
+!docs/*.png
 *.cache
 *.parquet
 *.npy
 .ipynb_checkpoints
-output/*
+output/
 notebook/wandb
 notebook/.ipynb_checkpoints
 notebook/dataset
@@ -27,4 +28,3 @@ __pycache__/
 
 # 出力結果
 .playwright-mcp
-output/

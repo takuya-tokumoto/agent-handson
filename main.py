@@ -1,40 +1,50 @@
+"""
+記事作成エージェント（メインエントリポイント）。
+
+Claude Agent SDK と MCP（Playwright / レビュー依頼ツール）で URL を読み、
+レビューエージェント（A2A）とやり取りしながら記事を完成させ、最終版を output/ に保存する。
+"""
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from typing import Any
 
-from claude_agent_sdk import query, ClaudeAgentOptions
+from dotenv import load_dotenv
+from claude_agent_sdk import query, ClaudeAgentOptions, tool, create_sdk_mcp_server
 from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
 from tools_action_manager import save_markdown, a2a_review
+from prompts import REQUEST_REVIEW_TOOL_DESCRIPTION, build_article_agent_prompt
+
+load_dotenv()
 
 DEFAULT_URL = "https://zenn.dev/tmtk/articles/624b98c6a52f09"
+MIN_CONTENT_LENGTH = 50
 
-BASE_INSTRUCTION = """
-あなたは社内向けの「記事作成エージェント」です。
-目的：指定URLを読み、Confluence貼り付け用のMarkdown記事を作成する。
 
-必須要件：
-- 見出しと箇条書きを多用して読みやすく
-- 最低でも次のセクションを含める：
-  - 要約
-  - 重要ポイント
-  - 参考リンク（参照元URLを必ず含める）
-  - 次アクション（社内での活用・検討観点）
-- 出力は日本語
-- Web閲覧は Playwright MCP を使う（必要最低限のアクセス回数で）
-"""
+@tool(
+    "request_review",
+    REQUEST_REVIEW_TOOL_DESCRIPTION,
+    {"draft_text": str},
+)
+async def request_review(args: dict[str, Any]) -> dict[str, Any]:
+    draft_text = args.get("draft_text") or ""
+    if not draft_text.strip():
+        raise ValueError("request_review には空でない draft_text を指定してください。")
+    review = await a2a_review(draft_text)
+    return {"content": [{"type": "text", "text": review}]}
 
-REVISION_INSTRUCTION = """
-あなたは社内向け記事の編集者です。
-与えられた「ドラフト」と「レビュー結果」をもとに、Confluence貼り付け用Markdownとして改善した最終版を出力してください。
 
-必須要件：
-- 「レビュー結果」で指摘された不足セクションや改善点を反映
-- 文章量が極端に増えないように、重要なところだけ改善
-- 参考リンクは維持し、必要なら増やす（一次ソース優先）
-"""
+# 記事作成エージェントがレビューを依頼するための MCP サーバ（同一プロセス内）
+review_mcp_server = create_sdk_mcp_server(
+    name="article_review",
+    version="1.0.0",
+    tools=[request_review],
+)
+
 
 def read_multiline(prompt: str) -> str:
+    """プロンプトを表示し、空行が入力されるまで行を読み取り、結合した文字列を返す。"""
     print(prompt)
     print("（入力終了は空行を1行入力）")
     lines = []
@@ -45,35 +55,59 @@ def read_multiline(prompt: str) -> str:
         lines.append(line)
     return "\n".join(lines).strip()
 
-async def run_agent(prompt: str, options: ClaudeAgentOptions) -> str:
-    result_text = ""
-    async for msg in query(prompt=prompt, options=options):
-        if isinstance(msg, AssistantMessage):
-            text_parts = [b.text for b in msg.content if isinstance(b, TextBlock)]
-            if text_parts:
-                result_text = "\n".join(text_parts)
-                print(result_text[:200], "..." if len(result_text) > 200 else "")
-        elif isinstance(msg, ResultMessage):
-            if msg.result:
-                result_text = msg.result
-    return result_text
 
-async def main():
-    # Playwright MCP（外部MCP：stdio）
+async def run_one_article_flow(url: str, user_prompt: str) -> None:
+    """1記事分の処理。記事作成エージェントがレビューツールを必要なだけ呼び、自律的に完成版を出す。"""
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+    final_path = f"output/final_{now}.md"
+
     options = ClaudeAgentOptions(
         mcp_servers={
             "playwright": {
                 "type": "stdio",
                 "command": "npx",
                 "args": ["-y", "@playwright/mcp@latest", "--headless", "--no-sandbox"],
-            }
+            },
+            "review": review_mcp_server,
         },
         allowed_tools=[
             "mcp__playwright__*",
-            "Read", "Write", "Edit", "Bash",
+            "mcp__review__request_review",
+            "Read",
+            "Write",
+            "Edit",
+            "Bash",
         ],
     )
 
+    prompt = build_article_agent_prompt(url, user_prompt)
+
+    print("\n--- 記事作成エージェントを開始（レビューはエージェントが自律的に依頼します）---\n")
+
+    result_text = ""
+    async for msg in query(prompt=prompt, options=options):
+        if isinstance(msg, AssistantMessage):
+            text_parts = [b.text for b in msg.content if isinstance(b, TextBlock)]
+            if text_parts:
+                result_text = "\n".join(text_parts)
+                print(result_text[:300], "..." if len(result_text) > 300 else "")
+        elif isinstance(msg, ResultMessage):
+            if msg.result:
+                result_text = msg.result
+
+    if not result_text or len(result_text.strip()) < MIN_CONTENT_LENGTH:
+        raise ValueError(
+            "記事作成エージェントから最終版が得られませんでした。"
+            " URL・プロンプトやレビューエージェントの起動を確認してください。"
+        )
+
+    save_markdown(final_path, result_text)
+    print("\n=== 完了 ===")
+    print(f"- Final: {final_path}\n")
+
+
+async def main() -> None:
+    """CLI ループ: URL と自由プロンプトを入力し、1 記事ずつ run_one_article_flow を実行する。"""
     print("=== 記事作成エージェント（自由プロンプト入力）===")
     print("終了する場合は URL 入力で Ctrl+C またはプロセス終了してください。\n")
 
@@ -84,53 +118,13 @@ async def main():
 
         user_prompt = read_multiline("自由プロンプト（例：経営層向け/技術者向け/短め/用語に注釈 等）>")
 
-        now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        draft_path = f"output/draft_{now}.md"
-        final_path = f"output/final_{now}.md"
+        await run_one_article_flow(url, user_prompt)
 
-        # 1) ドラフト生成（Playwright MCP を使って読む）
-        draft_prompt = f"""{BASE_INSTRUCTION}
 
-対象URL: {url}
-
-ユーザー要望（自由プロンプト）:
-{user_prompt if user_prompt else "(指定なし)"}
-
-出力は「完成したMarkdown本文のみ」を返してください。
-"""
-        print("\n--- ドラフト生成を開始 ---\n")
-        draft_text = await run_agent(draft_prompt, options)
-
-        save_markdown(draft_path, draft_text)
-
-        # 2) A2Aでレビュー
-        print("\n--- A2Aレビューを開始 ---\n")
-        review_text = await a2a_review(draft_text)
-
-        # 3) レビュー反映して最終版生成（Web閲覧は不要なので同じoptionsでOK）
-        revise_prompt = f"""{REVISION_INSTRUCTION}
-
-対象URL: {url}
-
-ドラフト:
-{draft_text}
-
-レビュー結果:
-{review_text}
-
-出力は「完成したMarkdown本文のみ」を返してください。
-"""
-        print("\n--- 最終版生成を開始 ---\n")
-        final_text = await run_agent(revise_prompt, options)
-
-        save_markdown(final_path, final_text)
-
-        print("\n=== 完了 ===")
-        print(f"- Draft : {draft_path}")
-        print(f"- Final : {final_path}\n")
-
-def _cli():
+def _cli() -> None:
+    """エントリポイント。asyncio で main を実行する。"""
     asyncio.run(main())
+
 
 if __name__ == "__main__":
     _cli()
