@@ -28,3 +28,6 @@ __pycache__/
 
 # 出力結果
 .playwright-mcp
+
+# 実行ログ
+log/

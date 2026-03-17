@@ -1,12 +1,63 @@
 """
-記事作成エージェント・レビューエージェント用のプロンプトと文言定義。
+記事作成エージェント・レビューエージェント用のプロンプトと文言を一括定義する。
 
-- 記事作成: ARTICLE_AGENT_INSTRUCTION, build_article_agent_prompt(), ツール説明
-- レビュー: REVIEW_AGENT_INSTRUCTION, エージェントカード用の名前・説明・スキル
+- 記事作成: ARTICLE_AGENT_INSTRUCTION（役割・手順）、build_article_agent_prompt()（URL・自由プロンプト付き）、
+  REQUEST_REVIEW_TOOL_DESCRIPTION（ツール説明）、validate_prompt_inputs()（プロンプト入力の検証）
+- レビュー: REVIEW_AGENT_INSTRUCTION（レビュー観点）、REVIEW_AGENT_* / REVIEW_SKILL_*（A2A エージェントカード用）
 
-main.py / review_agent.py はここから import して利用する。文言の変更はこのファイルのみで行う。
+main.py / review_agent.py から import して利用。文言の変更はこのファイルだけ触ればよい。
 """
+import re
 
+# -----------------------------------------------------------------------------
+# 記事作成エージェント用（入力検証）
+# -----------------------------------------------------------------------------
+
+# API で使用できない文字（サロゲート）の検出用
+_SURROGATE_PATTERN = re.compile(r"[\uD800-\uDFFF]")
+
+
+def _find_invalid_unicode(_label: str, s: str) -> list[tuple[int, str]]:
+    """文字列中の不正な Unicode（サロゲート）の位置とコードを (位置, U+XXXX) のリストで返す。"""
+    if not s:
+        return []
+    result: list[tuple[int, str]] = []
+    for m in _SURROGATE_PATTERN.finditer(s):
+        result.append((m.start(), f"U+{ord(m.group()):04X}"))
+    return result
+
+
+def validate_prompt_inputs(url: str, user_prompt: str) -> None:
+    """
+    記事作成プロンプトの入力（URL と自由プロンプト）に API で使用できない文字が含まれていないか検証する。
+    含まれる場合は、入力名・位置・文字コードを示して ValueError を送出する。
+    build_article_agent_prompt() に渡す前に main.py から呼ぶ想定。
+    """
+    url_s = (url or "").strip()
+    prompt_s = (user_prompt or "").strip()
+
+    errors: list[str] = []
+    for label, text in [("対象URL", url_s), ("自由プロンプト", prompt_s)]:
+        invalid = _find_invalid_unicode(label, text)
+        if invalid:
+            details = ", ".join(f"{pos + 1} 文字目: {code}" for pos, code in invalid[:5])
+            if len(invalid) > 5:
+                details += f" 他 {len(invalid) - 5} 箇所"
+            errors.append(f"- {label}: {details}")
+
+    if errors:
+        raise ValueError(
+            "入力に API で使用できない文字が含まれています（不正な Unicode）。\n"
+            "コピー＆ペースト元の文字や入力のやり直しを試してください。\n"
+            + "\n".join(errors)
+        )
+
+
+# -----------------------------------------------------------------------------
+# 記事作成エージェント用（プロンプト本文・ツール説明）
+# -----------------------------------------------------------------------------
+
+# Claude に渡す「役割と手順」のシステム的な指示。build_article_agent_prompt() の先頭に連結される。
 ARTICLE_AGENT_INSTRUCTION = """
 あなたは社内向けの「記事作成エージェント」です。
 
@@ -27,6 +78,7 @@ ARTICLE_AGENT_INSTRUCTION = """
 - ユーザーから自由プロンプト（例：経営層向け／技術者向け／短め）があればそれに沿う。
 """
 
+# request_review ツールの説明。Claude が「いつ・何回レビューを依頼するか」を判断するための文言。
 REQUEST_REVIEW_TOOL_DESCRIPTION = (
     "レビューエージェント（A2A）に記事ドラフトを送り、改善点やフィードバックを得る。"
     "指摘を反映したら再度このツールを呼んでよい。何回呼ぶかはあなたの判断に任せる。"
@@ -34,12 +86,13 @@ REQUEST_REVIEW_TOOL_DESCRIPTION = (
 
 
 def build_article_agent_prompt(url: str, user_prompt: str) -> str:
-    """記事作成エージェントに渡すプロンプトを組み立てる。"""
-    user_part = user_prompt.strip() if user_prompt else "(指定なし)"
+    """今回の対象 URL と自由プロンプトを ARTICLE_AGENT_INSTRUCTION に埋め込み、1 本のプロンプト文字列にする。"""
+    url_s = (url or "").strip()
+    user_part = (user_prompt or "").strip() or "(指定なし)"
     return f"""{ARTICLE_AGENT_INSTRUCTION}
 
 【今回の依頼】
-- 対象URL: {url}
+- 対象URL: {url_s}
 - ユーザー要望（自由プロンプト）: {user_part}
 
 上記の流れに従い、記事を作成し、レビューを繰り返してから最終版の Markdown 本文のみを出力してください。
@@ -50,7 +103,7 @@ def build_article_agent_prompt(url: str, user_prompt: str) -> str:
 # レビューエージェント（A2A）用の設定・文言
 # -----------------------------------------------------------------------------
 
-# エージェントカード（A2A で公開するメタデータ）
+# A2A の /.well-known/agent-card.json に載せるメタデータ
 REVIEW_AGENT_NAME = "レビューエージェント"
 REVIEW_AGENT_DESCRIPTION = "ドラフトをレビューしてチェックリストを返すA2Aエージェント。"
 REVIEW_SKILL_ID = "review_draft"
@@ -59,7 +112,7 @@ REVIEW_SKILL_DESCRIPTION = "Confluence向けドラフトの不足セクション
 REVIEW_SKILL_EXAMPLES = ["このドラフトをレビューして", "不足セクションを指摘して"]
 REVIEW_AGENT_VERSION = "1.0.0"
 
-# レビューエージェント用 LLM プロンプト（観点に基づく自律レビュー）
+# レビュー用 LLM への指示。観点に基づいてフィードバックを出すよう指定する。
 REVIEW_AGENT_INSTRUCTION = """
 あなたは社内向け Tech News まとめ記事の「レビュワー」です。
 Confluence 貼り付け用 Markdown ドラフトを受け取り、以下の観点に基づいてレビューし、改善点を簡潔に返してください。

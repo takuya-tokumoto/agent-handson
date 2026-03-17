@@ -16,7 +16,7 @@
 
 ---
 
-## 2. クイックスタート（clone して動かす）
+## 2. クイックスタート
 
 このリポジトリを clone し、環境変数を設定してから 2 つのプロセスを起動します。
 
@@ -50,7 +50,7 @@ cp .env.sample .env
 docker build -t agent-handson:latest .
 ```
 
-ベースイメージには Playwright 公式イメージを使用しており、ブラウザ実行に必要な依存が含まれています。
+ベースイメージには Playwright 公式イメージを使用しており、ブラウザ実行に必要な依存が含まれています。初回実行時にブラウザのインストールが走る場合は数分かかることがあります。
 
 ### 2.4 実行（2 プロセス）
 
@@ -82,9 +82,11 @@ docker run --rm -it \
 
 プロンプトに従って対象URLと自由プロンプトを入力すると、記事作成エージェントが URL を読み、ドラフトを作成し、**レビューエージェントに必要に応じて何度でもレビューを依頼**してから最終版を出力します。生成物は次のファイルに保存されます。
 
-- `output/final_YYYYMMDD_HHMMSS.md` … 最終版（レビューを繰り返したあとの完成記事）
+- `output/final_YYYYMMDD_HHMMSS.fff.md` … 最終版（レビューを繰り返したあとの完成記事。`.fff` はミリ秒で同一秒の上書きを防止）
+- `log/article_agent_YYYYMMDD_HHMMSS.fff.log` … 記事作成エージェントの実行ログ（1 実行ごと）
+- `log/review_agent_YYYYMMDD_HHMMSS.fff.log` … レビューエージェントの実行ログ（1 起動ごと。起動時に「詳細ログ: …」と表示）
 
-`-v "$PWD:/app"` でホストのカレントディレクトリをマウントしているため、生成物はホスト側の `agent-handson/output/` に残ります。終了する場合は Ctrl+C で終了してください。
+`-v "$PWD:/app"` でホストのカレントディレクトリをマウントしているため、生成物とログはホスト側の `agent-handson/` 配下に残ります。終了する場合は Ctrl+C で終了してください。
 
 ---
 
@@ -137,14 +139,20 @@ docker run --rm -it \
 - **API キーやモデル関連のエラーが出る**  
   `.env` を `.env.sample` からコピーしたうえで、`ANTHROPIC_API_KEY` と `ANTHROPIC_MODEL` を正しく設定しているか確認してください。
 
+- **「ブラウザをインストールします」のあと動かなくなる / 長く止まる**  
+  Dockerfile でビルド時に `npx playwright install chromium` を実行しているため、**イメージを再ビルド**（`docker build -t agent-handson:latest .`）すれば実行時の待ちは不要です。未ビルドや古いイメージの場合は初回のみ数分かかることがあります。
+
 - **レビュー時に「接続できませんでした」や Connection refused が出る**  
   ターミナル 1 で `review_agent.py` が起動しているか確認してください。先にレビューエージェントを起動してから、ターミナル 2 で `main.py` を実行します。
 
 - **最終版が得られない / 極端に短い**  
-  対象 URL が正しいか、Playwright MCP が正常に動作しているか、レビューエージェントが起動しているかを確認してください。最終版が空または 50 文字未満の場合は **ValueError が発生してプロセスが異常終了**します。
+  対象 URL が正しいか、Playwright MCP が正常に動作しているか、レビューエージェントが起動しているかを確認してください。最終版が空または 50 文字未満の場合は **ValueError が発生**し、その 1 件はスキップされてループは継続します。エラー時の詳細は `log/article_agent_*.log` を確認してください。
 
 - **Windows や macOS で Docker の `--network host` が使えない場合**  
   Linux 以外では `--network host` の挙動が異なります。記事作成エージェント用のコンテナからレビューエージェントへ接続するには、`A2A_BASE_URL=http://host.docker.internal:9999` を環境変数で渡すか、`.env` に追記してから `docker run` で `--env-file .env` を指定してください。
+
+- **「ProcessTransport is not ready for writing」が出る**  
+  本リポジトリでは `claude-agent-sdk>=0.1.46` を指定しており、[#386](https://github.com/anthropics/claude-agent-sdk-python/issues/386) 対応（[PR #630](https://github.com/anthropics/claude-agent-sdk-python/pull/630)）が含まれたバージョンを使います。`pip install -r requirements.txt` で 0.1.46 以上が入ることを確認してください。それでも出る場合は [SDK の Issue](https://github.com/anthropics/claude-agent-sdk-python/issues) で報告を検討してください。
 
 ---
 

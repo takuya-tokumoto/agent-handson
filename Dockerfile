@@ -17,5 +17,9 @@ RUN python3 -m pip install --upgrade pip && \
 # アプリ本体はマウント運用でも良いが、ここでは一応COPYも可能にしておく
 COPY . /app
 
+# permission_mode="bypassPermissions" は root では使えないため、非 root で実行する
+RUN chown -R 1000:1000 /app
+USER 1000
+
 # デフォルトはシェル（必要なら main.py にしてもOK）
 CMD ["bash"]
