@@ -1,0 +1,15 @@
+graph LR
+    User[ユーザー / CLI]
+    Main[main.py 記事作成エージェント]
+    SDK[Claude Agent SDK]
+    MCP[Playwright MCP ヘッドレスブラウザ]
+    Tools[tools_action_manager A2Aクライアント]
+    Review[review_agent.py レビューエージェント A2A]
+
+    User -->|URL・プロンプト| Main
+    Main --> SDK
+    SDK -->|Web閲覧| MCP
+    Main -->|ドラフト送信| Tools
+    Tools -->|HTTP| Review
+    Review -->|レビュー結果| Tools
+    Tools --> Main
